@@ -111,8 +111,28 @@ COORDINATOR_PORT=8080
    mvn exec:java -Dexec.mainClass="upb.worker.WorkerMain" -Dexec.args="Worker-2"
    ```
 
-3. **Ejecutar el Cliente de Prueba**:
+3. **Ejecutar el Benchmark Distribuido K-Means en C (RMI)**:
    ```bash
    cd ClientTestHPC
-   mvn exec:java -Dexec.mainClass="upb.client.ClientMain"
+   mvn exec:java -Dexec.mainClass="upb.client.ClientMain" -Dexec.args="localhost 1099"
    ```
+
+---
+
+## ⚡ Sistema HPC K-Means Distribuido en C vía Java RMI
+
+El sistema implementa el cálculo distribuido del algoritmo **K-Means Clustering** utilizando:
+1. **Coordinador RMI (Java 21)**: Publica la interfaz remota `IHpcCoordinator` en el registro RMI (`puerto 1099`). Distribuye las particiones del dataset entre los trabajadores disponibles por iteración mediante Virtual Threads, recalcula los centroides globales y evalúa la convergencia con tolerancia $\epsilon$.
+2. **Nodos Trabajadores (Java 21 + C)**: Implementan `IHpcWorker` y se autorregistran en el Coordinador. Para cada iteración, el método `computeKMeansPartition` invoca el binario nativo en **C (`kmeans_worker`)** optimizado con `gcc -O3`.
+3. **Motor C Nativo (`kmeans_worker.c`)**: Calcula las distancias euclidianas a los $K$ centroides en memoria de alto rendimiento y devuelve el recuento por clúster y las sumas acumuladas de coordenadas.
+4. **Despliegue Multi-Contenedor**: En Docker Compose (`fylesync-hpc-master`, `fylesync-hpc-worker1`, `fylesync-hpc-worker2`, `fylesync-hpc-worker3`, `fylesync-hpc-worker4`), permitiendo benchmarks transparentes en 1, 2, 3 y 4 nodos.
+
+### Resultados del Benchmark Multi-Nodo (Dataset 40,000 puntos, K=4, 15 iteraciones):
+
+| Nodos | Tiempo HPC (ms) | Tiempo RTT (ms) | Iteraciones | Speedup | Eficiencia |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | 1063 ms | 1154 ms | 15 | **1.00x** | **100.0%** |
+| **2** | 648 ms | 681 ms | 15 | **1.64x** | **82.0%** |
+| **3** | 639 ms | 650 ms | 15 | **1.66x** | **55.5%** |
+| **4** | 544 ms | 555 ms | 15 | **1.95x** | **48.9%** |
+
