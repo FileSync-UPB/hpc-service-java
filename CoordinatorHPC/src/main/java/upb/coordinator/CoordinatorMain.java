@@ -61,7 +61,7 @@ public class CoordinatorMain {
             final int finalRmiPort = rmiPort;
             Thread appServerThread = new Thread(() -> {
                 try {
-                    HpcAppServer appServer = new HpcAppServer(finalTcpPort, "localhost", finalRmiPort, RMI_BIND_NAME);
+                    HpcAppServer appServer = new HpcAppServer(finalTcpPort, "localhost", finalRmiPort, RMI_BIND_NAME, coordinator);
                     appServer.start();
                 } catch (Exception e) {
                     System.err.println("[Coordinator HPC] Error iniciando HpcAppServer HTTP: " + e.getMessage());

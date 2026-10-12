@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import upb.coordinator.monitoring.HpcMonitoringManager;
+import upb.coordinator.monitoring.HpcMonitoringView;
+import upb.coordinator.rmi.HpcCoordinatorImpl;
 import upb.hpc.rmi.IHpcCoordinator;
 import upb.hpc.rmi.KMeansRequest;
 import upb.hpc.rmi.KMeansResult;
@@ -26,6 +29,9 @@ import java.util.concurrent.Executors;
  * Dado que RMI es un protocolo nativo y exclusivo de Java, este Servidor de Aplicaciones
  * actúa como puente de comunicación para el cliente web, traduciendo peticiones HTTP
  * en invocaciones remotas RMI hacia el Coordinador HPC y sus nodos esclavos.
+ *
+ * Además, aloja y sirve directamente el Módulo de Monitoreo Integral del Clúster HPC
+ * accesible vía web en /monitoring.
  */
 public class HpcAppServer {
 
@@ -34,30 +40,47 @@ public class HpcAppServer {
     private final int rmiPort;
     private final String rmiServiceName;
     private final ObjectMapper mapper;
+    private final HpcMonitoringManager monitoringManager;
     private HttpServer httpServer;
 
     public HpcAppServer(int port, String rmiHost, int rmiPort, String rmiServiceName) {
+        this(port, rmiHost, rmiPort, rmiServiceName, null);
+    }
+
+    public HpcAppServer(int port, String rmiHost, int rmiPort, String rmiServiceName, HpcCoordinatorImpl coordinator) {
         this.port = port;
         this.rmiHost = (rmiHost != null && !rmiHost.isBlank()) ? rmiHost : "localhost";
         this.rmiPort = rmiPort;
         this.rmiServiceName = rmiServiceName;
         this.mapper = new ObjectMapper();
+        this.monitoringManager = new HpcMonitoringManager(coordinator);
     }
 
     public void start() throws IOException {
         httpServer = HttpServer.create(new InetSocketAddress(port), 0);
         httpServer.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
 
-        // Rutas del Servidor de Aplicaciones
+        // Rutas del Servidor de Aplicaciones para Cómputo HPC
         httpServer.createContext("/api/hpc/status", this::handleStatus);
         httpServer.createContext("/api/hpc/workers", this::handleWorkers);
         httpServer.createContext("/api/hpc/code-template", this::handleCodeTemplate);
         httpServer.createContext("/api/hpc/jobs/execute", this::handleExecuteJob);
         httpServer.createContext("/api/hpc/benchmark", this::handleBenchmark);
 
+        // Rutas del Módulo de Monitoreo Integral (Servido directamente por el Nodo Maestro Java)
+        httpServer.createContext("/monitoring", this::handleMonitoringWeb);
+        httpServer.createContext("/admin/monitoring", this::handleMonitoringWeb);
+        httpServer.createContext("/dashboard", this::handleMonitoringWeb);
+        httpServer.createContext("/api/hpc/monitoring", this::handleMonitoringApi);
+        httpServer.createContext("/api/hpc/monitoring/thresholds", this::handleMonitoringThresholds);
+        httpServer.createContext("/api/hpc/monitoring/export/csv", this::handleMonitoringExportCsv);
+        httpServer.createContext("/api/hpc/monitoring/export/json", this::handleMonitoringExportJson);
+        httpServer.createContext("/api/hpc/monitoring/reset", this::handleMonitoringReset);
+
         httpServer.start();
         System.out.println("[HpcAppServer] Servidor de Aplicaciones Java HTTP activo en puerto " + port +
                 " -> Traduciendo peticiones a Java RMI (" + rmiHost + ":" + rmiPort + "/" + rmiServiceName + ")");
+        System.out.println("[HpcAppServer] Consola de Monitoreo Web disponible en: http://localhost:" + port + "/monitoring");
     }
 
     public void stop() {
@@ -181,28 +204,40 @@ public class HpcAppServer {
             IHpcCoordinator coordinator = getCoordinator();
             KMeansRequest rmiRequest = new KMeansRequest(jobId, points, k, maxIterations, targetNodes, tolerance);
 
-            long appStart = System.currentTimeMillis();
-            // Invocacion REMOTA RMI
-            KMeansResult rmiResult = coordinator.executeKMeans(rmiRequest);
-            long appEnd = System.currentTimeMillis();
-            long totalRtt = appEnd - appStart;
+            monitoringManager.incrementActiveJobs();
+            try {
+                long appStart = System.currentTimeMillis();
+                // Invocacion REMOTA RMI
+                KMeansResult rmiResult = coordinator.executeKMeans(rmiRequest);
+                long appEnd = System.currentTimeMillis();
+                long totalRtt = appEnd - appStart;
 
-            Map<String, Object> resp = new LinkedHashMap<>();
-            resp.put("jobId", rmiResult.getJobId());
-            resp.put("jobName", jobName);
-            resp.put("status", rmiResult.getStatus());
-            resp.put("nodesUsed", rmiResult.getNodesUsed());
-            resp.put("totalPoints", rmiResult.getTotalPoints());
-            resp.put("k", rmiResult.getK());
-            resp.put("iterationsRun", rmiResult.getIterationsRun());
-            resp.put("totalComputationTimeMs", rmiResult.getTotalComputationTimeMs());
-            resp.put("appServerRmiRttMs", totalRtt);
-            resp.put("workerExecutionTimesMs", rmiResult.getWorkerExecutionTimesMs());
-            resp.put("finalCentroids", rmiResult.getFinalCentroids());
-            resp.put("clusterSizes", rmiResult.getClusterSizes());
-            resp.put("submittedCodeLength", code.length());
+                monitoringManager.recordJobExecution(
+                        rmiResult.getJobId(), jobName, rmiResult.getNodesUsed(),
+                        rmiResult.getTotalPoints(), rmiResult.getK(), rmiResult.getIterationsRun(),
+                        rmiResult.getTotalComputationTimeMs(), totalRtt,
+                        1.0, "SUCCESS", rmiResult.getWorkerExecutionTimesMs()
+                );
 
-            sendJsonResponse(exchange, 200, resp);
+                Map<String, Object> resp = new LinkedHashMap<>();
+                resp.put("jobId", rmiResult.getJobId());
+                resp.put("jobName", jobName);
+                resp.put("status", rmiResult.getStatus());
+                resp.put("nodesUsed", rmiResult.getNodesUsed());
+                resp.put("totalPoints", rmiResult.getTotalPoints());
+                resp.put("k", rmiResult.getK());
+                resp.put("iterationsRun", rmiResult.getIterationsRun());
+                resp.put("totalComputationTimeMs", rmiResult.getTotalComputationTimeMs());
+                resp.put("appServerRmiRttMs", totalRtt);
+                resp.put("workerExecutionTimesMs", rmiResult.getWorkerExecutionTimesMs());
+                resp.put("finalCentroids", rmiResult.getFinalCentroids());
+                resp.put("clusterSizes", rmiResult.getClusterSizes());
+                resp.put("submittedCodeLength", code.length());
+
+                sendJsonResponse(exchange, 200, resp);
+            } finally {
+                monitoringManager.decrementActiveJobs();
+            }
 
         } catch (Exception e) {
             System.err.println("[HpcAppServer] Error ejecutando trabajo: " + e.getMessage());
@@ -236,45 +271,57 @@ public class HpcAppServer {
             List<Map<String, Object>> benchmarkRuns = new ArrayList<>();
             double baseHpcTime = 0.0;
 
-            for (int nodes = 1; nodes <= maxNodesToTest; nodes++) {
-                String testJobId = "BENCH-" + nodes + "NODES-" + UUID.randomUUID().toString().substring(0, 5);
-                KMeansRequest request = new KMeansRequest(testJobId, points, k, maxIterations, nodes);
+            monitoringManager.incrementActiveJobs();
+            try {
+                for (int nodes = 1; nodes <= maxNodesToTest; nodes++) {
+                    String testJobId = "BENCH-" + nodes + "NODES-" + UUID.randomUUID().toString().substring(0, 5);
+                    KMeansRequest request = new KMeansRequest(testJobId, points, k, maxIterations, nodes);
 
-                long start = System.currentTimeMillis();
-                KMeansResult result = coordinator.executeKMeans(request);
-                long rtt = System.currentTimeMillis() - start;
+                    long start = System.currentTimeMillis();
+                    KMeansResult result = coordinator.executeKMeans(request);
+                    long rtt = System.currentTimeMillis() - start;
 
-                long hpcTime = result.getTotalComputationTimeMs();
-                if (nodes == 1) {
-                    baseHpcTime = (double) hpcTime;
+                    long hpcTime = result.getTotalComputationTimeMs();
+                    if (nodes == 1) {
+                        baseHpcTime = (double) hpcTime;
+                    }
+
+                    double speedup = baseHpcTime > 0 ? (baseHpcTime / Math.max(1.0, (double) hpcTime)) : 1.0;
+                    double efficiency = (speedup / nodes) * 100.0;
+
+                    Map<String, Object> runMap = new LinkedHashMap<>();
+                    runMap.put("nodes", nodes);
+                    runMap.put("hpcTimeMs", hpcTime);
+                    runMap.put("rttTimeMs", rtt);
+                    runMap.put("iterations", result.getIterationsRun());
+                    runMap.put("speedup", Math.round(speedup * 100.0) / 100.0);
+                    runMap.put("efficiency", Math.round(efficiency * 10.0) / 10.0);
+                    runMap.put("workerTimes", result.getWorkerExecutionTimesMs());
+                    runMap.put("clusterSizes", result.getClusterSizes());
+                    runMap.put("finalCentroids", result.getFinalCentroids());
+
+                    benchmarkRuns.add(runMap);
+
+                    // Registrar en historial de monitoreo
+                    monitoringManager.recordJobExecution(
+                            testJobId, "Benchmark Paralelo Multi-Nodo (" + nodes + " Nodos)",
+                            nodes, numPoints, k, result.getIterationsRun(),
+                            hpcTime, rtt, speedup, "SUCCESS", result.getWorkerExecutionTimesMs()
+                    );
                 }
 
-                double speedup = baseHpcTime > 0 ? (baseHpcTime / Math.max(1.0, (double) hpcTime)) : 1.0;
-                double efficiency = (speedup / nodes) * 100.0;
+                Map<String, Object> resp = new LinkedHashMap<>();
+                resp.put("status", "SUCCESS");
+                resp.put("totalPoints", numPoints);
+                resp.put("k", k);
+                resp.put("maxIterations", maxIterations);
+                resp.put("activeWorkersDetected", activeWorkers);
+                resp.put("runs", benchmarkRuns);
 
-                Map<String, Object> runMap = new LinkedHashMap<>();
-                runMap.put("nodes", nodes);
-                runMap.put("hpcTimeMs", hpcTime);
-                runMap.put("rttTimeMs", rtt);
-                runMap.put("iterations", result.getIterationsRun());
-                runMap.put("speedup", Math.round(speedup * 100.0) / 100.0);
-                runMap.put("efficiency", Math.round(efficiency * 10.0) / 10.0);
-                runMap.put("workerTimes", result.getWorkerExecutionTimesMs());
-                runMap.put("clusterSizes", result.getClusterSizes());
-                runMap.put("finalCentroids", result.getFinalCentroids());
-
-                benchmarkRuns.add(runMap);
+                sendJsonResponse(exchange, 200, resp);
+            } finally {
+                monitoringManager.decrementActiveJobs();
             }
-
-            Map<String, Object> resp = new LinkedHashMap<>();
-            resp.put("status", "SUCCESS");
-            resp.put("totalPoints", numPoints);
-            resp.put("k", k);
-            resp.put("maxIterations", maxIterations);
-            resp.put("activeWorkersDetected", activeWorkers);
-            resp.put("runs", benchmarkRuns);
-
-            sendJsonResponse(exchange, 200, resp);
 
         } catch (Exception e) {
             System.err.println("[HpcAppServer] Error en benchmark: " + e.getMessage());
@@ -491,6 +538,91 @@ int main(int argc, char *argv[]) {
         exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         byte[] bytes = mapper.writeValueAsString(data).getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(statusCode, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    // ==========================================
+    // Handlers del Módulo de Monitoreo Integral
+    // ==========================================
+    private void handleMonitoringWeb(HttpExchange exchange) throws IOException {
+        if (handleCors(exchange)) return;
+        sendHtmlResponse(exchange, 200, HpcMonitoringView.getDashboardHtml());
+    }
+
+    private void handleMonitoringApi(HttpExchange exchange) throws IOException {
+        if (handleCors(exchange)) return;
+        try {
+            Map<String, Object> report = monitoringManager.getFullMonitoringReport();
+            sendJsonResponse(exchange, 200, report);
+        } catch (Exception e) {
+            sendError(exchange, 500, "Error generando reporte de monitoreo: " + e.getMessage());
+        }
+    }
+
+    private void handleMonitoringThresholds(HttpExchange exchange) throws IOException {
+        if (handleCors(exchange)) return;
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            sendError(exchange, 405, "Método no permitido. Use POST.");
+            return;
+        }
+        try {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            JsonNode json = mapper.readTree(body);
+            double maxCpu = json.has("maxCpuPercent") ? json.get("maxCpuPercent").asDouble() : 85.0;
+            double maxMem = json.has("maxMemoryPercent") ? json.get("maxMemoryPercent").asDouble() : 80.0;
+            int maxTime = json.has("maxExecutionTimeMs") ? json.get("maxExecutionTimeMs").asInt() : 5000;
+            int minWorkers = json.has("minActiveWorkers") ? json.get("minActiveWorkers").asInt() : 4;
+
+            monitoringManager.updateThresholds(maxCpu, maxMem, maxTime, minWorkers);
+            sendJsonResponse(exchange, 200, Map.of(
+                    "status", "SUCCESS",
+                    "message", "Umbrales actualizados con éxito",
+                    "thresholds", monitoringManager.getThresholdsMap()
+            ));
+        } catch (Exception e) {
+            sendError(exchange, 400, "Error procesando umbrales: " + e.getMessage());
+        }
+    }
+
+    private void handleMonitoringExportCsv(HttpExchange exchange) throws IOException {
+        if (handleCors(exchange)) return;
+        String csv = monitoringManager.exportCsv();
+        sendTextResponse(exchange, 200, csv, "text/csv; charset=UTF-8", "reporte_hpc_metricas.csv");
+    }
+
+    private void handleMonitoringExportJson(HttpExchange exchange) throws IOException {
+        if (handleCors(exchange)) return;
+        Map<String, Object> report = monitoringManager.getFullMonitoringReport();
+        String json = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(report);
+        sendTextResponse(exchange, 200, json, "application/json; charset=UTF-8", "reporte_hpc_metricas.json");
+    }
+
+    private void handleMonitoringReset(HttpExchange exchange) throws IOException {
+        if (handleCors(exchange)) return;
+        monitoringManager.resetMetrics();
+        sendJsonResponse(exchange, 200, Map.of("status", "SUCCESS", "message", "Métricas reiniciadas con éxito"));
+    }
+
+    private void sendHtmlResponse(HttpExchange exchange, int statusCode, String html) throws IOException {
+        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+        byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(statusCode, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    private void sendTextResponse(HttpExchange exchange, int statusCode, String text, String contentType, String filename) throws IOException {
+        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        if (filename != null && !filename.isBlank()) {
+            exchange.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        }
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
         exchange.sendResponseHeaders(statusCode, bytes.length);
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);

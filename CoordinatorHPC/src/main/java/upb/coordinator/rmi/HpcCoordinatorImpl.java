@@ -43,6 +43,21 @@ public class HpcCoordinatorImpl extends UnicastRemoteObject implements IHpcCoord
         return new ArrayList<>(workers.keySet());
     }
 
+    public Map<String, Long> getWorkerPingLatencies() {
+        Map<String, Long> latencies = new LinkedHashMap<>();
+        for (Map.Entry<String, IHpcWorker> entry : workers.entrySet()) {
+            try {
+                long t0 = System.currentTimeMillis();
+                boolean pong = entry.getValue().ping();
+                long t1 = System.currentTimeMillis();
+                latencies.put(entry.getKey(), pong ? Math.max(1L, t1 - t0) : -1L);
+            } catch (Exception e) {
+                latencies.put(entry.getKey(), -1L);
+            }
+        }
+        return latencies;
+    }
+
     private void cleanupDeadWorkers() {
         Iterator<Map.Entry<String, IHpcWorker>> it = workers.entrySet().iterator();
         while (it.hasNext()) {
